@@ -53,6 +53,26 @@ static ssize_t gpio_write(struct file *file, const char __user *buf,size_t len, 
 	}
 	return len;
 }
+static ssize_t gpio_read(struct file *file,char __user *buf, size_t len,loff_t *off)
+{
+
+	uint8_t  gpio_state[4]={0,0,0,0};
+	if(len<1)
+		return 0;
+	for(int i=0;i<mem_size;i++)
+	{
+	gpio_state[i] = gpiod_get_value(gpio_desc[i]);
+	kernel_buf[i]=gpio_state[i];
+	}
+
+	if(copy_to_user(buf,kernel_buf,len)>0)
+	{
+		pr_err("Error: Data not Read properly..!\n");
+		return -EFAULT;
+	}
+	pr_info("GPIO Pin State read successfully\n");
+	return len;
+}
 
 static struct file_operations fops=
 {
@@ -60,6 +80,7 @@ static struct file_operations fops=
 	.open=gpio_open,
 	.release=gpio_release,
 	.write=gpio_write,
+        .read=gpio_read
 };
 
 static int __init multi_gpio_init(void)
