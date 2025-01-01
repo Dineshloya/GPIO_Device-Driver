@@ -1,1 +1,190 @@
+#include <linux/module.h>
+#include <linux/fs.h>
+#include <linux/gpio.h>
+#include <linux/uaccess.h>
+#include <linux/cdev.h>
+#include<linux/device.h>
+#include<linux/kdev_t.h>
+
+#define DEVICE_NAME "gpio_dev"
+#define GPIO_COUNT 4
+
+static int gpio_pins[GPIO_COUNT] = {17, 18, 19, 20}; // GPIO pins
+static int major;
+static struct cdev gpio_cdev;
+static struct class *gpio_class;
+static struct gpio_desc *gpio_desc[4];
+uint8_t *kernel_buf;
+static dev_t dev;
+
+static int gpio_open(struct inode *inode, struct file *file) {
+    int minor = iminor(inode);
+    if (minor >= GPIO_COUNT) {
+        printk(KERN_ERR "Invalid minor number %d\n", minor);
+        return -ENODEV;
+    }
+
+    printk(KERN_INFO "GPIO device file %d opened\n", minor);
+    return 0;
+}
+
+static ssize_t gpio_read(struct file *file, char __user *buf, size_t count, loff_t *offset) {
+    int minor = iminor(file_inode(file));
+    int gpio_value;
+
+    if (minor >= GPIO_COUNT) return -ENODEV;
+
+    gpio_value = gpiod_get_value(gpio_desc[minor]);
+    kernel_buf[minor]=gpio_value;
+    kernel_buf[minor]= gpio_value ? '1' : '0';
+
+    if (copy_to_user(buf,&kernel_buf[minor], 1)) return -EFAULT;
+
+    printk(KERN_INFO "GPIO %d read value: %c\n", gpio_pins[minor], kernel_buf[minor]);
+    return 1; // Return number of bytes read
+}
+
+static ssize_t gpio_write(struct file *file, const char __user *buf, size_t count, loff_t *offset) {
+    int minor = iminor(file_inode(file));
+    
+
+    if (minor >= GPIO_COUNT) return -ENODEV;
+
+    if (copy_from_user(&kernel_buf[minor], buf, 1)) return -EFAULT;
+
+    if (kernel_buf[minor] == '1') {
+        gpiod_set_value(gpio_desc[minor], 1);
+        printk(KERN_INFO "GPIO %d set to HIGH\n", gpio_pins[minor]);
+    } else if (kernel_buf[minor]== '0') {
+        gpiod_set_value(gpio_desc[minor], 0);
+        printk(KERN_INFO "GPIO %d set to LOW\n", gpio_pins[minor]);
+    } else {
+        printk(KERN_ERR "Invalid value for GPIO %d: %c\n", gpio_pins[minor], kernel_buf[minor]);
+        return -EINVAL;
+    }
+
+    return count; // Return number of bytes written
+}
+
+static int gpio_release(struct inode *inode, struct file *file) {
+    int minor = iminor(inode);
+    printk(KERN_INFO "GPIO device file %d closed\n", minor);
+    return 0;
+}
+
+static struct file_operations fops = {
+    .owner = THIS_MODULE,
+    .open = gpio_open,
+    .read = gpio_read,
+    .write = gpio_write,
+    .release = gpio_release,
+};
+
+static int __init gpio_init(void) {
+    int ret, i;
+
+    // Allocate device numbers
+    ret = alloc_chrdev_region(&dev, 0, GPIO_COUNT, DEVICE_NAME);
+    if (ret < 0) {
+        printk(KERN_ERR "Failed to allocate device numbers\n");
+        return ret;
+    }
+    pr_info("Multi_device_gpio: Major:%d",MAJOR(dev));
+
+    for(i=0;i<GPIO_COUNT;i++)
+	    pr_info("Multi_device_gpio%d: Major:%d, Minor:%d",i,MAJOR(dev),i);
+    
+    major = MAJOR(dev);
+
+    // Initialize cdev
+    cdev_init(&gpio_cdev, &fops);
+    gpio_cdev.owner = THIS_MODULE;
+
+    ret = cdev_add(&gpio_cdev, dev, GPIO_COUNT);
+    if (ret < 0) {
+        printk(KERN_ERR "Failed to add cdev\n");
+        unregister_chrdev_region(dev, GPIO_COUNT);
+	cdev_del(&gpio_cdev);
+        return ret;
+    }
+
+    // Create device class
+    gpio_class = class_create(THIS_MODULE, DEVICE_NAME);
+    if (IS_ERR(gpio_class)) {
+        printk(KERN_ERR "Failed to create class\n");
+        cdev_del(&gpio_cdev);
+        unregister_chrdev_region(dev, GPIO_COUNT);
+        return PTR_ERR(gpio_class);
+    }
+
+    // Request GPIOs and create device files
+    for (i = 0; i < GPIO_COUNT; i++) 
+    {	    
+        device_create(gpio_class, NULL, MKDEV(major, i), NULL, DEVICE_NAME "%d", i);
+        if (!gpio_is_valid(gpio_pins[i])) 
+	{
+            printk(KERN_ERR "Invalid GPIO pin %d\n", gpio_pins[i]);
+            ret = -ENODEV;
+            goto fail;
+        }
+	if(!(gpio_desc[i]=gpio_to_desc(gpio_pins[i])))
+	{
+		pr_err("GPIO %d is not Valid..!\n",gpio_pins[i]);
+	}
+
+        ret = gpio_request(gpio_pins[i], DEVICE_NAME);
+        if (ret) 
+	{
+            printk(KERN_ERR "Failed to request GPIO %d\n", gpio_pins[i]);
+            goto fail;
+        }
+
+	if((kernel_buf=kmalloc(GPIO_COUNT, GFP_KERNEL))==0)
+	{
+		pr_info("cannot allocate memory in kernel\n");
+		class_destroy(gpio_class);
+	}
+
+  gpio_direction_output(gpio_pins[i], 0);
+	gpiod_export(gpio_desc[i],true);
+    }
+
+    printk(KERN_INFO "GPIO driver initialized\n");
+    return 0;
+
+fail:
+    for (; i >= 0; i--) {
+        gpio_free(gpio_pins[i]);
+        device_destroy(gpio_class, MKDEV(major, i));
+    }
+    class_destroy(gpio_class);
+    cdev_del(&gpio_cdev);
+    unregister_chrdev_region(dev, GPIO_COUNT);
+    return ret;
+}
+
+static void __exit gpio_exit(void) {
+    int i;
+    dev_t dev = MKDEV(major, 0);
+
+    for (i = 0; i < GPIO_COUNT; i++) 
+    {
+	    gpiod_unexport(gpio_desc[i]);
+            gpio_free(gpio_pins[i]);
+            device_destroy(gpio_class, MKDEV(major, i));
+    }
+    class_destroy(gpio_class);
+    cdev_del(&gpio_cdev);
+    unregister_chrdev_region(dev, GPIO_COUNT);
+
+    printk(KERN_INFO "GPIO driver unloaded\n");
+}
+
+module_init(gpio_init);
+module_exit(gpio_exit);
+
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("Dinesh");
+MODULE_DESCRIPTION("GPIO Driver with Multiple Device Files");
+MODULE_VERSION("1.0");
 
